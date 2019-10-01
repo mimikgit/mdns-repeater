@@ -79,9 +79,35 @@ int shutdown_flag = 0;
 char *pid_file = PIDFILE;
 
 //------------------ Begin mk_unicast_repeater --------------------------------
+/* MK_UNICAST_REPEATER: Author Varadhan Venkataseshan : Mimik Technology Inc */
+
 #ifndef MK_UNICAST_REPEATER
 #define MK_UNICAST_REPEATER
 #endif
+
+/******************************************************************************
+A simple threaded prototype for supporting mimik mdns unicast repeater:
+Code has been added under define MK_UNICAST_REPEATER. 
+It basically co-exists with the current repeater and does the following.
+
+Step1: Rapidly filters received packets containing mimik mdns
+       packets with QU(Questions Requesting Unicast Responses) flags set.
+- mk_ingress_mdns_unicast_pkt_filter(pkt_data, recvsize);
+
+Step2: If Step1 succeeds, takes the ownership of repeating the matched packet to
+       all given interfaces.
+
+Step3: Waits for a maximum of 2 seconds(configurable) to receive unicast answer
+       reply from mdns server to the question sent in Step2. And on receipt of
+       a unicast response to the mdns packet sent in Step2, forwards the
+       response pkt back to the originating source node-src_addr:port.
+
+- mk_handle_qu_pkt_repeater(g_pmri,server_sockfd, pkt_data, recvsize, &fromaddr);
+
+NOTE: Does not change the logic of repeating in anyway to the packets that
+      fails filter checks made in Step1
+
+*******************************************************************************/
 
 #ifdef MK_UNICAST_REPEATER
 
@@ -786,28 +812,6 @@ end_main:
 
 #define MDNS_FILTER_HDRSZ 12
 
-/* mdns header
-
- 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|               id              |           flags               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|               queries         |           answers             |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|               auth_rr         |           add_rr              |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/                                                               /
-[.......c_str 0 terminated variable Length query txt ...........]
-/                                                               /
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|               type            |           class/QU            |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-our mdns query signature: id=0,flags=0,queries=1,answers=0,auth_rr=0,add_rr=0,type=12(ptr),QU
-
-*/
-
 int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
                                       struct sockaddr_in *src_addr)
 {
@@ -817,14 +821,14 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    // And should have unicast reply request bit set. The question txt has mk prefix
 
    // Our packet selection filters:
-   // dns.flags.response == 0  // It is a query and a response
+   // dns.flags.response == 0  // It is a query and not a response
    // dns.count.queries == 1   // It has only 1 question
    // dns.count.answers == 0   // It has Answer RRs: 0
    // dns.count.auth_rr == 0   // It has Authority RRs: 0
    // dns.count.add_rr == 0    // It has Additional RRs: 0
 
    // Additional filters:
-   // dns.qry.name == "_mk-v12-f13059f487a42c69900f62a92d9f46b4._tcp.local"  //qry name contains prefix _mk
+   // dns.qry.name contains  "_mk" //query name contains prefix _mk
    // dns.qry.type == 12 Type: PTR (domain name PoinTeR) (12)
    // dns.qry.class == 0x0001  // Class: IN (0x0001)
 
