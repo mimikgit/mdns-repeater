@@ -33,6 +33,8 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sys/time.h>
 
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR "224.0.0.251"
@@ -75,6 +77,93 @@ int foreground = 0;
 int shutdown_flag = 0;
 
 char *pid_file = PIDFILE;
+
+//------------------ Begin mk_unicast_repeater --------------------------------
+#ifndef MK_UNICAST_REPEATER
+#define MK_UNICAST_REPEATER
+#endif
+
+#ifdef MK_UNICAST_REPEATER
+
+/* mdns header
+
+ 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               id              |           flags               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               queries         |           answers             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               auth_rr         |           add_rr              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/                                                               /
+[.......c_str 0 terminated variable Length query txt ...........]
+/                                                               /
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               type            |           class/QU            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+our mdns query signature: id=0,flags=0,queries=1,answers=0,auth_rr=0,add_rr=0,type=12(ptr),QU
+
+*/
+
+ #define MAX_UNICAST_IFS 5
+ // #define DFT_MK_NW_INTF "docker0"
+typedef struct IfsInfo {
+    // Interface name
+    char ifname[IFNAMSIZ];
+    struct in_addr ifaddr;
+    struct in_addr ifmask;
+    int sd;
+}IfsInfo;
+
+#define INGRESS_PKTLIMIT 512
+typedef struct MkRepeaterBlock {
+   // sk_origin tuple is the key of the MkRepeaterBlock
+   struct sockaddr_in sk_origin; // from address of the origin
+   int ingress_sd; // socket from which to send to origin node
+   int  peerdata_len;   // current "received from" or "to be sent" to peer data
+   char peerdata[INGRESS_PKTLIMIT+1]; // buffer that holds ingress peer data
+   // An array of interface socket to repeat multicast and receive uni-casted pkt
+   int numifs;
+   IfsInfo ifrsds[MAX_UNICAST_IFS];
+   // void * pmri; //may be keep a reference to its parent info block
+}MkRepeaterBlock;
+
+typedef struct MkRepeaterInfo{
+ #define MAX_UNICAST_REPEATERS 50
+ int rpt_cnt;
+ unsigned int t_in;
+ pthread_mutex_t rmtx;
+ int numifs;
+ IfsInfo ifRefs[MAX_UNICAST_IFS];
+  // TODO add an efficient data structure to manage multiple unciast repeaters
+  //      for handling concurrent peers with only a single thread of control and
+  //      using an efficient i/o multiplexing.
+  // NOTE: the key for such a data structure will be the ip:port of the src node.
+  // MkRepeaterBlock rblocks[MAX_UNICAST_REPEATERS];
+}MkRepeaterInfo;
+
+static MkRepeaterInfo *g_pmri = NULL;
+
+MkRepeaterInfo* mk_init_unicast_repeater(void);
+
+int mk_destroy_unicast_repeater(MkRepeaterInfo *pmri);
+
+int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
+                              struct sockaddr_in *src_addr);
+
+int mk_setup_repater_socket(IfsInfo *pifs, char *updateifname);
+
+MkRepeaterBlock * mk_alloc_repeater_block(MkRepeaterInfo *pmri, struct sockaddr_in *src_addr);
+int mk_free_repeater_block(MkRepeaterBlock * pmb);
+
+int mk_handle_qu_pkt_repeater(MkRepeaterInfo *pmri, int rxsd, void *rxpkt, size_t pktlen,
+                              struct sockaddr_in *src_addr);
+void * mk_mdns_unicast_pkt_repeater_thread(void *targ);
+
+#endif
+//------------------ End mk_unicast_repeater -----------------------------------
 
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
@@ -484,6 +573,7 @@ int main(int argc, char *argv[]) {
 	pid_t running_pid;
 	fd_set sockfd_set;
 	int r = 0;
+        int rc = 0;
 
 	parse_opts(argc, argv);
 
@@ -536,6 +626,28 @@ int main(int argc, char *argv[]) {
 		r = 1;
 		goto end_main;
 	}
+
+#ifdef MK_UNICAST_REPEATER
+        g_pmri = mk_init_unicast_repeater();
+        if (!g_pmri) {
+           printf("mk_init_unicast_repeater failed \n");
+        }
+        else {
+	  for (int i = 0; i < num_socks && i < MAX_UNICAST_IFS; i++) {
+	     // For now copy the list of interface details from socks
+	     // TODO get the list of all network interface details from system.
+	     if (socks[i].ifname) {
+		 strncpy(g_pmri->ifRefs[i].ifname, socks[i].ifname,IFNAMSIZ);
+		 memcpy(&g_pmri->ifRefs[i].ifaddr, &socks[i].addr, sizeof(struct in_addr));
+		 memcpy(&g_pmri->ifRefs[i].ifmask, &socks[i].mask, sizeof(struct in_addr));
+		 g_pmri->numifs ++;
+		 printf("%d) ifname[%s] addr[%s] mask[%s] \n",i,g_pmri->ifRefs[i].ifname,
+			inet_ntoa(g_pmri->ifRefs[i].ifaddr),
+			inet_ntoa(g_pmri->ifRefs[i].ifmask));
+	     }
+	  }
+        }
+#endif
 
 	while (! shutdown_flag) {
 		struct timeval tv = {
@@ -606,7 +718,21 @@ int main(int argc, char *argv[]) {
 
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-
+                        
+#ifdef MK_UNICAST_REPEATER
+                   if (g_pmri) {
+                      rc = mk_ingress_mdns_unicast_pkt_filter(server_sockfd, pkt_data, recvsize, &fromaddr);
+                      if (rc == 0) {
+                         printf("Success: pkt matched out filter check \n");
+                         // call the ingress unicast packet repeater function here.
+                         rc = mk_handle_qu_pkt_repeater(g_pmri,server_sockfd, pkt_data, recvsize, &fromaddr);
+                         if (rc == 0) {
+                            printf("Success: mk_handle_qu_pkt_repeater\n");
+         		    continue;
+                         }
+                      }
+                   }
+#endif
 			for (j = 0; j < num_socks; j++) {
 				// do not repeat packet back to the same network from which it originated
 				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
@@ -645,7 +771,535 @@ end_main:
 	if (already_running() == getpid())
 		unlink(pid_file);
 
+#ifdef MK_UNICAST_REPEATER
+        if (g_pmri) {
+          mk_destroy_unicast_repeater(g_pmri);
+        }
+#endif
 	log_message(LOG_INFO, "exit.");
 
 	return r;
 }
+
+#ifdef MK_UNICAST_REPEATER
+//------------------ Begin mk_unicast_repeater --------------------------------
+
+#define MDNS_FILTER_HDRSZ 12
+
+/* mdns header
+
+ 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               id              |           flags               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               queries         |           answers             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               auth_rr         |           add_rr              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/                                                               /
+[.......c_str 0 terminated variable Length query txt ...........]
+/                                                               /
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|               type            |           class/QU            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+our mdns query signature: id=0,flags=0,queries=1,answers=0,auth_rr=0,add_rr=0,type=12(ptr),QU
+
+*/
+
+int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
+                                      struct sockaddr_in *src_addr)
+{
+   //Step1 : Apply pre filters to quickly determine if it is a packet of interest for further processing.
+
+   // All we want to check is: It is only a query pkt with just 1 question and no answers;
+   // And should have unicast reply request bit set. The question txt has mk prefix
+
+   // Our packet selection filters:
+   // dns.flags.response == 0  // It is a query and a response
+   // dns.count.queries == 1   // It has only 1 question
+   // dns.count.answers == 0   // It has Answer RRs: 0
+   // dns.count.auth_rr == 0   // It has Authority RRs: 0
+   // dns.count.add_rr == 0    // It has Additional RRs: 0
+
+   // Additional filters:
+   // dns.qry.name == "_mk-v12-f13059f487a42c69900f62a92d9f46b4._tcp.local"  //qry name contains prefix _mk
+   // dns.qry.type == 12 Type: PTR (domain name PoinTeR) (12)
+   // dns.qry.class == 0x0001  // Class: IN (0x0001)
+
+   // Most important and mandatory filter
+   // dns.qry.qu == 1          // It has unicast bit set : "QU" question: True
+
+   unsigned char *pU8Cur = (unsigned char *)rxpkt;
+   uint16_t *pU16 = (uint16_t *)rxpkt;
+   uint16_t val16 = 0;
+   uint16_t txtlen = 0;
+
+   if ((!rxpkt)||(!src_addr)||(pktlen <= MDNS_FILTER_HDRSZ)||(pktlen > INGRESS_PKTLIMIT)) {
+       printf("%s() ingress packet len = %ld not valid \n",__func__,pktlen);
+       return -1;
+   }
+
+   // skip mdns Query Identifier(id): we do not need to validate pU16[0]
+
+   // check flags for QR (Query(0)/Response(1)) Bit at (0x8000)
+   val16 = ntohs(pU16[1]);
+   if ((val16 & (1<<15)) == 0x8000) {
+     // we are interested in only query packet and not Response
+     printf("%s() mdns.flags.query is expected and not response. flags=%hu\n",__func__,val16);
+     return -1;
+   }
+
+   // check for dns.count.queries == 1
+   val16 = ntohs(pU16[2]);
+   if (val16 != 1) {
+     printf("%s() mdns.count.queries(%hu) != expected(1) \n",__func__,val16);
+     return -1;
+   }
+
+   // check for dns.count.answers == 0
+   val16 = ntohs(pU16[3]);
+   if (val16 != 0) {
+     printf("%s() mdns.count.answer(%hu) != expected(0) \n",__func__,val16);
+     return -1;
+   }
+
+   // check for dns.count.auth_rr == 0
+   val16 = ntohs(pU16[4]);
+   if (val16 != 0) {
+     printf("%s() mdns.count.auth_rr(%hu) != expected(0) \n",__func__,val16);
+     return -1;
+   }
+
+   // check for dns.count.add_rr == 0    // should have Additional RRs: 0
+   val16 = ntohs(pU16[3]);
+   if (val16 != 0) {
+     // not ours.
+     printf("%s() mdns.count.add_rr(%u) != expected(0) \n",__func__,val16);
+     return -1;
+   }
+
+   // point to query txt and gets the null terminated string length
+   pU8Cur += MDNS_FILTER_HDRSZ; // increment by 12 bytes
+   txtlen = strlen((const char *)pU8Cur);
+
+   // check if pktlen has enough data still left for type/class/qu
+   if (pktlen < (txtlen + MDNS_FILTER_HDRSZ + 5)) {
+     // range check failed
+     printf("%s() pktlen=%ld < txtlen(%hu) + 12 + 5 \n",__func__,pktlen,txtlen);
+     return -1;
+   }
+
+   pU8Cur += (txtlen + 1); // add 1 byte for string termination 0
+   // update pU16 with current position 
+   pU16 = (uint16_t *)pU8Cur;
+   
+   // dns.qry.type == PTR
+   #define MDNS_QRY_TYPE_PTR 12
+   val16 = ntohs(pU16[0]);
+   if (val16 != MDNS_QRY_TYPE_PTR) {
+     printf("%s() mdns.qry.type(%u) != PTR(%u) \n",__func__,val16,MDNS_QRY_TYPE_PTR);
+     return -1;
+   }
+
+   // mdns qry : class and qu occupy 16 bits, we need only QU test here.
+   // dns.qry.class == 0x0001  // Class: IN (0x0001)
+
+   // Most important and mandatory filter
+   // dns.qry.qu == 1          // It has unicast bit set : "QU" question: True
+   val16 = ntohs(pU16[1]);
+   // check the Most significant bit of val16 where QU is being set
+   if ((val16 & 0x8000) != 0x8000) {
+      printf("%s() mdns.qry.qu=0, unicast(QU) bit not set val16=0x%X \n",__func__,val16);
+      return -1;
+   }
+
+   #define QN_TXT_CHK_PREFIX "_mk"
+   if (txtlen < strlen(QN_TXT_CHK_PREFIX)) {
+     //range check failed
+     return -1;
+   }
+   // Txt prefix check can be omitted if needed
+   if (!strstr((char *)rxpkt + MDNS_FILTER_HDRSZ , QN_TXT_CHK_PREFIX)) {
+     printf("%s() expected prefix[%s] not in qn txt[%s] \n",__func__,QN_TXT_CHK_PREFIX,pU8Cur);
+     return -1;
+   }
+
+   printf("%s(!success!) pkt with QU matches => %s \n",__func__,(char *)rxpkt + MDNS_FILTER_HDRSZ);
+
+   return 0;
+}
+
+int mk_handle_qu_pkt_repeater(MkRepeaterInfo *pmri, int rxsd, void *rxpkt, size_t pktlen, 
+                                    struct sockaddr_in *src_addr)
+{
+   MkRepeaterBlock *pmb = NULL;
+   pthread_t t;
+   int i=0;
+   int rc=0;
+
+   if ((!pmri)||(!rxpkt)||(!src_addr)||(pktlen <= MDNS_FILTER_HDRSZ)||(pktlen > INGRESS_PKTLIMIT)) {
+       printf("%s() ingress packet len = %ld not valid \n",__func__,pktlen);
+       return -1;
+   }
+
+   pmb = mk_alloc_repeater_block(pmri,src_addr);
+   if (!pmb) {
+       printf("%s() mk_alloc_repeater_block failed \n",__func__);
+       return -1;
+   }
+
+   memcpy(&pmb->sk_origin,src_addr,sizeof(struct sockaddr_in));
+   pmb->ingress_sd = rxsd;
+   memcpy(pmb->peerdata,rxpkt,pktlen);
+   pmb->peerdata_len = pktlen;
+
+   memcpy(pmb->ifrsds,pmri->ifRefs,sizeof(IfsInfo)*pmri->numifs);
+   pmb->numifs = pmri->numifs;
+   for (i = 0 ; (i < pmb->numifs) && (i < MAX_UNICAST_IFS) ; i++) {
+      rc = mk_setup_repater_socket(&pmb->ifrsds[i],NULL);
+      if ( rc < 0 ) {
+        printf("%s() i=%d mk_setup_repater_socket failed for interface=%s addr=%s \n",
+                __func__,i,pmb->ifrsds[i].ifname,inet_ntoa(pmb->ifrsds[i].ifaddr));
+        memset(&pmb->ifrsds[i],0,sizeof(IfsInfo));
+      }
+   }
+
+   //  For now spin a thread to handle this.
+   //  TODO: change from n:m threads to  scalable n:1 thread, so that all the
+   //  requets are handled in just one thread -- with suitable i/o wait of sds.
+
+   rc = pthread_create(&t, NULL, mk_mdns_unicast_pkt_repeater_thread, (void *)pmb);
+   if ( rc != 0 ) {
+      printf("%s() pthread_create failed errno=%d %s \n",
+                  __func__,errno,strerror(errno));
+      return -1;
+   }
+
+   return rc;
+}
+
+void * mk_mdns_unicast_pkt_repeater_thread(void *targ)
+{
+  MkRepeaterBlock *pmb = (MkRepeaterBlock *)targ;
+  int rc = 0;
+  struct sockaddr_in src_addr;
+  socklen_t addrlen = sizeof(src_addr);
+  #define RX_BUFF 2048
+  char recv_buff[RX_BUFF] = {0}; //more than enough for our response
+  #define MK_RESPONSE_WAIT_SEC 2
+  struct timeval tstart= {0,0};
+  struct timeval cur_t = {0,0};
+  long int elapsedms = 0;
+  long int timeoutms = MK_RESPONSE_WAIT_SEC * 1000;
+  ssize_t iret = 0;
+  int err = 0;
+  int i = 0;
+  struct timeval tvsel = {0,0};
+  fd_set rfds;
+
+   if (!pmb) {
+     return NULL;
+   }
+   pthread_detach(pthread_self());
+
+   //Step1: repeat -- multicast the received pkts -- from a dedicated src port
+   for (i = 0; (i < pmb->numifs); i++) {
+       IfsInfo *p = &pmb->ifrsds[i];
+       if (p->sd  <= 0) {
+          continue;
+       }
+       // do not repeat pkt back to the same network from which it originated
+       //TODO verify if this check is needed for mk_ packets.
+	if ((pmb->sk_origin.sin_addr.s_addr & p->ifmask.s_addr) ==
+                                (p->ifaddr.s_addr & p->ifmask.s_addr)) {
+		printf("%s() NOT repeating data to itself %s sockfd=%d \n",__func__,p->ifname,p->sd); 
+		continue;
+        }
+	// repeat data
+	rc = send_packet(p->sd, pmb->peerdata, (size_t)pmb->peerdata_len);
+	if (rc < 0) {
+            // TODO mark the IfsInfo of this block with a flag.
+	    printf("%s() send_packet error %s: \n", __func__,strerror(errno));
+            continue;
+	}
+   } // end of for loop of if socks
+  
+   //Step2 : timedwait i/o wait to get response from all interfaces 
+
+
+  tvsel.tv_sec = MK_RESPONSE_WAIT_SEC;
+  tvsel.tv_usec = 0;
+
+  rc = gettimeofday(&tstart, NULL);
+  if (rc < 0) {
+     printf("%s() gettimeofday error %s",__func__,strerror(errno));
+  }
+
+  do {
+       // Add the interface sockets to i/o select wait.
+       int maxsd = 0;
+       err = 0;
+       FD_ZERO(&rfds);
+       for (i = 0; (i < pmb->numifs); i++) {
+	  IfsInfo *p = &pmb->ifrsds[i];
+	  if (p->sd  <= 0) {
+	     continue;
+	  }
+
+	  FD_SET(p->sd, &rfds);
+
+	  if (p->sd > maxsd) {
+	    maxsd = p->sd;  //note down the max sd for use with select i/o later
+	  }
+       } //end of for loop of if socks
+
+       if (maxsd <= 0) {
+          err = 1;
+          break ;
+       }
+
+       // wait on select and process the response
+       tvsel.tv_sec = MK_RESPONSE_WAIT_SEC;
+       tvsel.tv_usec = 0;
+       rc = select(maxsd + 1, &rfds, NULL, NULL, &tvsel);
+       if (rc > 0) {
+	     for (i = 0; (i < pmb->numifs); i++) {
+		IfsInfo *p = &pmb->ifrsds[i];
+		if (p->sd  <= 0) {
+		   continue;
+		}
+		if (FD_ISSET(p->sd, &rfds)) {
+                     // do a recvfrom followed by send to origin using the origin socket.
+		      memset(recv_buff, 0, RX_BUFF);
+		      memset(&src_addr,0,sizeof(src_addr));
+		      iret = (int)recvfrom(p->sd, recv_buff, RX_BUFF, 0,
+					 (struct sockaddr *)&src_addr, &addrlen);
+		      if (iret < 0) {
+			  // May be continue with rest of the interface sockets.
+			  continue;
+		      }
+
+		      if (iret > 0) {
+			 //process the unciasted packet.
+			 //Now send the response packet back to the originating node rightaway.
+	                 rc = sendto(pmb->ingress_sd, recv_buff, iret, 0, 
+                                      (struct sockaddr *)&pmb->sk_origin, sizeof(struct sockaddr_in));
+                         //TODO : decide if we need to create another source socket or use p->sd
+                         // We are now trying with the actual server software.
+		      }
+		}
+	     } //end of for loop of if socks
+       } else if (rc == 0) {
+	 // rc == 0 select timeout occured
+	 printf("%s() select receive timeout:%d sec", __func__,MK_RESPONSE_WAIT_SEC);
+	 break;
+       } else {
+	 //(rc < 0) : select error
+	 err = 1;
+	 printf("%s() select() error %d %s",__func__,errno,strerror(errno) );
+	 break;
+       }
+
+        if (timeoutms > 0) {
+	  rc = gettimeofday(&cur_t, NULL);
+	  if (rc < 0) {
+             printf("%s() gettimeofday error %s",__func__,strerror(errno));
+	  }
+
+	  elapsedms = ((cur_t.tv_usec - tstart.tv_usec)/1000) +
+			  (cur_t.tv_sec - tstart.tv_sec)*1000 ;
+        }
+
+     } while((err == 0) && ((timeoutms > 0)&&(elapsedms >=0)&&(elapsedms < timeoutms)));
+
+   printf("%s() returning, err=%d timeoutms=%ld, elapsedms=%ld \n",
+  	    __func__,err,timeoutms,elapsedms);
+
+   mk_free_repeater_block(pmb);
+   return NULL;
+}
+
+MkRepeaterInfo* mk_init_unicast_repeater(void)
+{
+   MkRepeaterInfo * pmri = malloc(sizeof(MkRepeaterInfo));
+   if (!pmri) {
+      return NULL;
+   }
+   memset(pmri,0,sizeof(MkRepeaterInfo));
+   if (pthread_mutex_init(&pmri->rmtx,NULL) != 0) {
+     free(pmri);
+     return NULL;
+   }
+   return pmri;
+}
+
+int mk_destroy_unicast_repeater(MkRepeaterInfo *pmri)
+{
+   if (!pmri) {
+      return -1;
+   }
+   pthread_mutex_destroy(&pmri->rmtx);
+   // memset(pmri,0,sizeof(MkRepeaterInfo));
+   free(pmri);
+   g_pmri = NULL;
+   return 0;
+}
+
+MkRepeaterBlock * mk_alloc_repeater_block(MkRepeaterInfo *pmri, struct sockaddr_in *src_addr)
+{
+  MkRepeaterBlock *pmb = NULL;
+  if ( !pmri ) {
+    return NULL;
+  }
+
+  if (pmri->rpt_cnt < MAX_UNICAST_REPEATERS) {
+     // TODO avoid malloc and get it from preallocated slots.
+     pmb = malloc(sizeof(MkRepeaterBlock));
+  }
+
+  //pmb will be NULL if mallco failed or (rpt_cnt >= MAX_UNICAST_REPEATERS)
+  if (!pmb) {
+    //unlikley but check
+     return NULL;
+  }
+
+  pthread_mutex_lock(&pmri->rmtx);
+    pmri->rpt_cnt++;
+  pthread_mutex_unlock(&pmri->rmtx);
+
+  pmri->t_in++;
+  return pmb;
+}
+
+int mk_free_repeater_block(MkRepeaterBlock * pmb)
+{
+  int i=0;
+  if (!pmb) {
+    return -1;
+  }
+  for (i = 0; (i < pmb->numifs) && (i < MAX_UNICAST_IFS); i++) {
+      if (pmb->ifrsds[i].sd > 0) {
+         close(pmb->ifrsds[i].sd);
+      }
+  }
+  memset(pmb,0,sizeof(MkRepeaterBlock));
+
+  if (g_pmri) {
+    pthread_mutex_lock(&g_pmri->rmtx);
+      g_pmri->rpt_cnt--;
+    pthread_mutex_unlock(&g_pmri->rmtx);
+  }
+
+  return 0;
+}
+
+int mk_setup_repater_socket(IfsInfo *pifs, char *updateifname)
+{
+	int rc = -1;
+	int val = 1;
+	struct ifreq ifr;
+	struct in_addr *if_addr = NULL ;
+	struct sockaddr_in saddr;
+	struct ip_mreq mreq;
+
+        if (!pifs) {
+          return -1;
+        }
+        // if update of the existing or new need to be added, then replace old one
+        if (updateifname && (strlen(updateifname) > 0)) {
+           printf("%s() replacing old pifs->ifname(%s) with updateifname(%s) \n",
+                      __func__,pifs->ifname,updateifname);
+           pifs->ifaddr.s_addr = 0;
+           pifs->ifmask.s_addr = 0;
+           pifs->sd = 0;
+           strncpy(pifs->ifname,updateifname,IFNAMSIZ);
+        }
+
+	pifs->sd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (pifs->sd < 0) {
+	  printf("%s() socket() failed errno=%d %s \n",__func__,errno,strerror(errno));
+	  return -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, pifs->ifname, IFNAMSIZ);
+	if_addr = &((struct sockaddr_in *) &ifr.ifr_addr)->sin_addr;
+
+#ifdef SO_BINDTODEVICE
+	rc = setsockopt(pifs->sd, SOL_SOCKET, SO_BINDTODEVICE, pifs->ifname, strlen(pifs->ifname)+1);
+	if (rc < 0) {
+	     printf("pif->sd(%d) setsockopt(SO_BINDTODEVICE) ifname=%s: error %s \n",
+                                pifs->sd,pifs->ifname,strerror(errno));
+             close(pifs->sd);
+             pifs->sd = 0;
+	     return rc;
+	}
+#endif
+
+	// get interface netmask
+        if (pifs->ifmask.s_addr == 0) {
+	   if (ioctl(pifs->sd, SIOCGIFNETMASK, &ifr) == 0) {
+		memcpy(&pifs->ifmask, if_addr, sizeof(struct in_addr));
+	   }
+        }
+
+	// get interface address
+        if (pifs->ifaddr.s_addr == 0) {
+	   if (ioctl(pifs->sd, SIOCGIFADDR, &ifr) == 0) {
+		memcpy(&pifs->ifaddr, if_addr, sizeof(struct in_addr));
+	   }
+        }
+
+        val = 1;
+	rc = setsockopt(pifs->sd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+	if (rc < 0) {
+	    log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %s \n", strerror(errno));
+            close(pifs->sd);
+            pifs->sd = 0;
+            return rc;
+	}
+
+	memset(&saddr, 0, sizeof(saddr));
+	saddr.sin_family = AF_INET;
+	saddr.sin_port = 0; // important let system choose
+	saddr.sin_addr.s_addr = pifs->ifaddr.s_addr; //bind to this interface adddress
+	rc = bind(pifs->sd, (struct sockaddr *)&saddr, sizeof(saddr));
+	if (rc < 0) {
+	  printf("%s() bind() failed errno=%d %s \n",__func__,errno,strerror(errno));
+          close(pifs->sd);
+          pifs->sd = 0;
+	  return rc;
+	}
+
+	rc = setsockopt(pifs->sd, IPPROTO_IP, IP_MULTICAST_IF, &saddr.sin_addr, sizeof(saddr.sin_addr));
+	if (rc < 0) {
+	        printf("%s() setsockpot IP_MULTICAST_IF failed errno=%d %s \n",
+                      __func__,errno,strerror(errno));
+                close(pifs->sd);
+                pifs->sd = 0;
+		return rc;
+	}
+
+	memset(&mreq, 0, sizeof(struct ip_mreq));
+	mreq.imr_interface.s_addr = pifs->ifaddr.s_addr;
+	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
+	if ((rc = setsockopt(pifs->sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
+		log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
+                close(pifs->sd);
+		return rc;
+	}
+
+	// enable loopback : TODO decide if we need it for this case.
+        val = 1;
+	if ((rc = setsockopt(pifs->sd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val))) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
+		return rc;
+	}
+
+	return 0;
+}
+
+//------------------ End   mk_unicast_repeater ---------------------------------
+#endif
