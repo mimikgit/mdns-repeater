@@ -1196,6 +1196,7 @@ int mk_free_repeater_block(MkRepeaterBlock * pmb)
     pthread_mutex_unlock(&g_pmri->rmtx);
   }
 
+  free(pmb);
   return 0;
 }
 
