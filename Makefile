@@ -26,7 +26,7 @@ all: mdns-repeater
 
 mdns-repeater.o: _hgversion
 
-mdns-repeater: mdns-repeater.o
+mdns-repeater: mdns-repeater.o -lpthread
 
 .PHONY: zip
 zip: TMPDIR := $(shell mktemp -d)
