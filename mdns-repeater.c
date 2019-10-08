@@ -33,7 +33,6 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
-#include <pthread.h>
 #include <sys/time.h>
 
 #define PACKAGE "mdns-repeater"
@@ -86,7 +85,7 @@ char *pid_file = PIDFILE;
 #endif
 
 /******************************************************************************
-A simple threaded prototype for supporting mimik mdns unicast repeater:
+A simple module for supporting mimik mdns unicast repeater:
 Code has been added under define MK_UNICAST_REPEATER. 
 It basically co-exists with the current repeater and does the following.
 
@@ -97,10 +96,8 @@ Step1: Rapidly filters received packets containing mimik mdns
 Step2: If Step1 succeeds, takes the ownership of repeating the matched packet to
        all given interfaces.
 
-Step3: Waits for a maximum of 2 seconds(configurable) to receive unicast answer
-       reply from mdns server to the question sent in Step2. And on receipt of
-       a unicast response to the mdns packet sent in Step2, forwards the
-       response pkt back to the originating source node-src_addr:port.
+Step3: And on receipt of a unicast response to the mdns packet sent in Step2,
+forwards the response pkt back to the originating source node-src_addr:port.
 
 - mk_handle_qu_pkt_repeater(g_pmri,server_sockfd, pkt_data, recvsize, &fromaddr);
 
@@ -133,6 +130,69 @@ our mdns query signature: id=0,flags=0,queries=1,answers=0,auth_rr=0,add_rr=0,ty
 
 */
 
+// Varadhan Venkataseshan : added simple hash functionality 
+typedef unsigned int (*function_gen_hash) (void *key);
+unsigned int mk_gen_mbyte_khash(void *key);
+unsigned int multi_byte_compare(const void *key1, const void *key2);
+
+typedef void * (*hash_alloc_t)   (int size);
+typedef void   (*hash_free_t)    (void *ptr);
+typedef unsigned int    (*hash_comp_t)    (const void *key1, const void *key2);
+typedef void   (*hash_destroy_t) (void *data);
+
+typedef struct HashNode {
+    struct HashNode *next;
+    void *key;
+    void *data;
+}HashNode;
+
+typedef struct MultiByteKey {
+   unsigned char *kval;
+   unsigned int klen;
+}MultiByteKey;
+
+//(1 << 13)
+#define HASH_MAX_NODES 8192 
+
+typedef struct mkHashInfo
+{
+   unsigned int          used;
+   unsigned int          numSlots;
+   HashNode     **ppSlots;
+   function_gen_hash     gen_key_hash;
+   hash_comp_t  comp;
+   hash_alloc_t alloc;
+   hash_free_t  dealloc;
+   hash_destroy_t  destroy_key;
+   hash_destroy_t  destroy_data;
+}mkHashInfo;
+
+typedef struct HashIter {
+  HashNode *node;  
+  int bidx;         
+  mkHashInfo *hash;       
+} HashIter;
+
+int mk_hash_init(mkHashInfo     *ctx,
+              unsigned int            numSlots,
+              function_gen_hash    gen_key_hash,
+              hash_comp_t    comp,
+              hash_alloc_t   alloc,
+              hash_free_t    dealloc,
+              hash_destroy_t destroy_key,
+              hash_destroy_t destroy_data
+);
+
+void mk_hash_deinit(mkHashInfo *ctx);
+int mk_hash_insert(mkHashInfo *ctx, void *data, void *key);
+void mk_hash_remove(mkHashInfo *ctx, void *key);
+void *mk_hash_find(mkHashInfo *ctx, void *key);
+void mk_hash_destroy_all(mkHashInfo *ctx);
+HashNode *mk_hash_iter_begin(HashIter *iter, mkHashInfo *hash);
+HashNode *mk_hash_iter_next(HashIter *iter);
+int mk_hash_get_used(mkHashInfo *ctx);
+
+
  #define MAX_UNICAST_IFS 5
  // #define DFT_MK_NW_INTF "docker0"
 typedef struct IfsInfo {
@@ -152,27 +212,41 @@ typedef struct MkRepeaterBlock {
    char peerdata[INGRESS_PKTLIMIT+1]; // buffer that holds ingress peer data
    // An array of interface socket to repeat multicast and receive uni-casted pkt
    int numifs;
-   IfsInfo ifrsds[MAX_UNICAST_IFS];
-   // void * pmri; //may be keep a reference to its parent info block
+   IfsInfo *ifrsds; // pointer to onetime IfsInfo socket.
+   void * pmri; // reference to its parent info block.
+
+   MultiByteKey key; 
+   #define MAX_TXT_KEY_SZ 128
+   #define KEY_START_POS 1
+   #define KEY_END_SZ 40
+   char quKeyName[MAX_TXT_KEY_SZ+1];
+   int quKeyNameLen;
+   struct timeval tlast;
+
 }MkRepeaterBlock;
 
 typedef struct MkRepeaterInfo{
- #define MAX_UNICAST_REPEATERS 50
+ #define MK_HASH_COUNT 997 
+ // use a prime number for the has size, just in case if the hash uses %
+ // would yield good index speard.
+ #define MAX_UNICAST_REPEATERS MK_HASH_COUNT
  int rpt_cnt;
  unsigned int t_in;
- pthread_mutex_t rmtx;
+ int ingress_sd; // socket from which to send to origin node
  int numifs;
  IfsInfo ifRefs[MAX_UNICAST_IFS];
-  // TODO add an efficient data structure to manage multiple unciast repeaters
-  //      for handling concurrent peers with only a single thread of control and
-  //      using an efficient i/o multiplexing.
-  // NOTE: the key for such a data structure will be the ip:port of the src node.
-  // MkRepeaterBlock rblocks[MAX_UNICAST_REPEATERS];
+ //MkRepeaterBlock rblocks[MAX_UNICAST_REPEATERS];
+
+  // hash ENTER.key is MkRepeaterBlock(pmb->quKeyName)
+  // hash ENTER.data is its MkRepeaterBlock instance
+ mkHashInfo quHash; 
+
 }MkRepeaterInfo;
 
 static MkRepeaterInfo *g_pmri = NULL;
 
-MkRepeaterInfo* mk_init_unicast_repeater(void);
+int mk_init_unicast_repeater(MkRepeaterInfo ** ppgmri,
+                                      struct if_sock *ifs, int numifs, int rxsd);
 
 int mk_destroy_unicast_repeater(MkRepeaterInfo *pmri);
 
@@ -181,12 +255,14 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
 
 int mk_setup_repater_socket(IfsInfo *pifs, char *updateifname);
 
-MkRepeaterBlock * mk_alloc_repeater_block(MkRepeaterInfo *pmri, struct sockaddr_in *src_addr);
-int mk_free_repeater_block(MkRepeaterBlock * pmb);
+MkRepeaterBlock * mk_alloc_repeater_block(MkRepeaterInfo *pmri);
+void mk_free_repeater_block(void *vpmb);
 
 int mk_handle_qu_pkt_repeater(MkRepeaterInfo *pmri, int rxsd, void *rxpkt, size_t pktlen,
                               struct sockaddr_in *src_addr);
-void * mk_mdns_unicast_pkt_repeater_thread(void *targ);
+//void * mk_mdns_unicast_ifs_sock_select_add(void *targ);
+int mk_mdns_unicast_ifs_sock_select_process(MkRepeaterInfo *pmri, fd_set *prfds, int numfd);
+int mk_mdns_unicast_pkt_repeater_snd(MkRepeaterBlock *pmb);
 
 #endif
 //------------------ End mk_unicast_repeater -----------------------------------
@@ -537,7 +613,7 @@ static int parse_opts(int argc, char *argv[]) {
 
 				num_blacklisted_subnets++;
 
-				msg = malloc(128);
+				msg = (char *)malloc(128);
 				memset(msg, 0, 128);
 				tostring(ss, msg, 128);
 				log_message(LOG_INFO, "blacklist %s", msg);
@@ -570,7 +646,7 @@ static int parse_opts(int argc, char *argv[]) {
 
 				num_whitelisted_subnets++;
 
-				msg = malloc(128);
+				msg = (char *)malloc(128);
 				memset(msg, 0, 128);
 				tostring(ss, msg, 128);
 				log_message(LOG_INFO, "whitelist %s", msg);
@@ -654,28 +730,16 @@ int main(int argc, char *argv[]) {
 	}
 
 #ifdef MK_UNICAST_REPEATER
-        g_pmri = mk_init_unicast_repeater();
-        if (!g_pmri) {
+        rc = mk_init_unicast_repeater(&g_pmri, socks, num_socks, server_sockfd);
+        if ((rc != 0) || (!g_pmri)) {
            printf("mk_init_unicast_repeater failed \n");
-        }
-        else {
-	  for (int i = 0; i < num_socks && i < MAX_UNICAST_IFS; i++) {
-	     // For now copy the list of interface details from socks
-	     // TODO get the list of all network interface details from system.
-	     if (socks[i].ifname) {
-		 strncpy(g_pmri->ifRefs[i].ifname, socks[i].ifname,IFNAMSIZ);
-		 memcpy(&g_pmri->ifRefs[i].ifaddr, &socks[i].addr, sizeof(struct in_addr));
-		 memcpy(&g_pmri->ifRefs[i].ifmask, &socks[i].mask, sizeof(struct in_addr));
-		 g_pmri->numifs ++;
-		 printf("%d) ifname[%s] addr[%s] mask[%s] \n",i,g_pmri->ifRefs[i].ifname,
-			inet_ntoa(g_pmri->ifRefs[i].ifaddr),
-			inet_ntoa(g_pmri->ifRefs[i].ifmask));
-	     }
-	  }
         }
 #endif
 
 	while (! shutdown_flag) {
+
+                int maxsd = server_sockfd ;
+
 		struct timeval tv = {
 			.tv_sec = 10,
 			.tv_usec = 0,
@@ -683,9 +747,32 @@ int main(int argc, char *argv[]) {
 
 		FD_ZERO(&sockfd_set);
 		FD_SET(server_sockfd, &sockfd_set);
-		int numfd = select(server_sockfd + 1, &sockfd_set, NULL, NULL, &tv);
+#ifdef MK_UNICAST_REPEATER
+// Add interface sockets : atmost one per interface
+                if (g_pmri) {
+                   int i = 0;
+		   for (i = 0; (i < g_pmri->numifs); i++) {
+		      IfsInfo *p = &g_pmri->ifRefs[i];
+		      if (p->sd  <= 0) {
+			 continue;
+		      }
+
+		      FD_SET(p->sd, &sockfd_set);
+
+		      if (p->sd > maxsd) {
+			maxsd = p->sd;  //note down the max sd for use with select i/o later
+		      }
+		   } //end of for loop of if socks
+                }
+#endif
+		int numfd = select(maxsd + 1, &sockfd_set, NULL, NULL, &tv);
 		if (numfd <= 0)
 			continue;
+
+#ifdef MK_UNICAST_REPEATER
+              
+                rc = mk_mdns_unicast_ifs_sock_select_process(g_pmri, &sockfd_set, numfd);
+#endif
 
 		if (FD_ISSET(server_sockfd, &sockfd_set)) {
 			struct sockaddr_in fromaddr;
@@ -742,18 +829,19 @@ int main(int argc, char *argv[]) {
 				}
 			}
 
-			if (foreground)
-				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+			// if (foreground)
+			//	printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
                         
 #ifdef MK_UNICAST_REPEATER
                    if (g_pmri) {
                       rc = mk_ingress_mdns_unicast_pkt_filter(server_sockfd, pkt_data, recvsize, &fromaddr);
                       if (rc == 0) {
-                         printf("Success: pkt matched out filter check \n");
+                         // printf("%s() Success: pkt matched out filter check \n",__func__);
                          // call the ingress unicast packet repeater function here.
-                         rc = mk_handle_qu_pkt_repeater(g_pmri,server_sockfd, pkt_data, recvsize, &fromaddr);
+                        rc = mk_handle_qu_pkt_repeater(g_pmri,server_sockfd, pkt_data, recvsize, &fromaddr);
                          if (rc == 0) {
-                            printf("Success: mk_handle_qu_pkt_repeater\n");
+                            // printf("%s() Success: mk_handle_qu_pkt_repeater t_in=%u rpt_cnt=%d \n",
+                            //                  __func__,g_pmri->t_in,g_pmri->rpt_cnt);
          		    continue;
                          }
                       }
@@ -764,8 +852,8 @@ int main(int argc, char *argv[]) {
 				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
 					continue;
 
-				if (foreground)
-					printf("repeating data to %s\n", socks[j].ifname);
+				// if (foreground)
+				//	printf("repeating data to %s\n", socks[j].ifname);
 
 				// repeat data
 				ssize_t sentsize = send_packet(socks[j].sockfd, pkt_data, (size_t) recvsize);
@@ -841,7 +929,7 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    uint16_t txtlen = 0;
 
    if ((!rxpkt)||(!src_addr)||(pktlen <= MDNS_FILTER_HDRSZ)||(pktlen > INGRESS_PKTLIMIT)) {
-       printf("%s() ingress packet len = %ld not valid \n",__func__,pktlen);
+       // printf("%s() ingress packet len = %ld not valid \n",__func__,pktlen);
        return -1;
    }
 
@@ -851,28 +939,28 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    val16 = ntohs(pU16[1]);
    if ((val16 & (1<<15)) == 0x8000) {
      // we are interested in only query packet and not Response
-     printf("%s() mdns.flags.query is expected and not response. flags=%hu\n",__func__,val16);
+     // printf("%s() mdns.flags.query is expected and not response. flags=%hu\n",__func__,val16);
      return -1;
    }
 
    // check for dns.count.queries == 1
    val16 = ntohs(pU16[2]);
    if (val16 != 1) {
-     printf("%s() mdns.count.queries(%hu) != expected(1) \n",__func__,val16);
+     // printf("%s() mdns.count.queries(%hu) != expected(1) \n",__func__,val16);
      return -1;
    }
 
    // check for dns.count.answers == 0
    val16 = ntohs(pU16[3]);
    if (val16 != 0) {
-     printf("%s() mdns.count.answer(%hu) != expected(0) \n",__func__,val16);
+     // printf("%s() mdns.count.answer(%hu) != expected(0) \n",__func__,val16);
      return -1;
    }
 
    // check for dns.count.auth_rr == 0
    val16 = ntohs(pU16[4]);
    if (val16 != 0) {
-     printf("%s() mdns.count.auth_rr(%hu) != expected(0) \n",__func__,val16);
+     // printf("%s() mdns.count.auth_rr(%hu) != expected(0) \n",__func__,val16);
      return -1;
    }
 
@@ -880,7 +968,7 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    val16 = ntohs(pU16[3]);
    if (val16 != 0) {
      // not ours.
-     printf("%s() mdns.count.add_rr(%u) != expected(0) \n",__func__,val16);
+     // printf("%s() mdns.count.add_rr(%u) != expected(0) \n",__func__,val16);
      return -1;
    }
 
@@ -891,7 +979,7 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    // check if pktlen has enough data still left for type/class/qu
    if (pktlen < (txtlen + MDNS_FILTER_HDRSZ + 5)) {
      // range check failed
-     printf("%s() pktlen=%ld < txtlen(%hu) + 12 + 5 \n",__func__,pktlen,txtlen);
+     // printf("%s() pktlen=%ld < txtlen(%hu) + 12 + 5 \n",__func__,pktlen,txtlen);
      return -1;
    }
 
@@ -903,7 +991,7 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    #define MDNS_QRY_TYPE_PTR 12
    val16 = ntohs(pU16[0]);
    if (val16 != MDNS_QRY_TYPE_PTR) {
-     printf("%s() mdns.qry.type(%u) != PTR(%u) \n",__func__,val16,MDNS_QRY_TYPE_PTR);
+     // printf("%s() mdns.qry.type(%u) != PTR(%u) \n",__func__,val16,MDNS_QRY_TYPE_PTR);
      return -1;
    }
 
@@ -915,7 +1003,7 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    val16 = ntohs(pU16[1]);
    // check the Most significant bit of val16 where QU is being set
    if ((val16 & 0x8000) != 0x8000) {
-      printf("%s() mdns.qry.qu=0, unicast(QU) bit not set val16=0x%X \n",__func__,val16);
+      // printf("%s() mdns.qry.qu=0, unicast(QU) bit not set val16=0x%X \n",__func__,val16);
       return -1;
    }
 
@@ -926,11 +1014,11 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
    }
    // Txt prefix check can be omitted if needed
    if (!strstr((char *)rxpkt + MDNS_FILTER_HDRSZ , QN_TXT_CHK_PREFIX)) {
-     printf("%s() expected prefix[%s] not in qn txt[%s] \n",__func__,QN_TXT_CHK_PREFIX,pU8Cur);
+     // printf("%s() expected prefix[%s] not in qn txt[%s] \n",__func__,QN_TXT_CHK_PREFIX,pU8Cur);
      return -1;
    }
 
-   printf("%s(!success!) pkt with QU matches => %s \n",__func__,(char *)rxpkt + MDNS_FILTER_HDRSZ);
+   // printf("%s(!success!) pkt with QU matches => %s \n",__func__,(char *)rxpkt + MDNS_FILTER_HDRSZ);
 
    return 0;
 }
@@ -938,17 +1026,16 @@ int mk_ingress_mdns_unicast_pkt_filter(int sockfd, void *rxpkt, size_t pktlen,
 int mk_handle_qu_pkt_repeater(MkRepeaterInfo *pmri, int rxsd, void *rxpkt, size_t pktlen, 
                                     struct sockaddr_in *src_addr)
 {
+  
    MkRepeaterBlock *pmb = NULL;
-   pthread_t t;
-   int i=0;
    int rc=0;
 
    if ((!pmri)||(!rxpkt)||(!src_addr)||(pktlen <= MDNS_FILTER_HDRSZ)||(pktlen > INGRESS_PKTLIMIT)) {
-       printf("%s() ingress packet len = %ld not valid \n",__func__,pktlen);
+       // printf("%s() ingress packet len = %ld not valid \n",__func__,pktlen);
        return -1;
    }
 
-   pmb = mk_alloc_repeater_block(pmri,src_addr);
+   pmb = mk_alloc_repeater_block(pmri);
    if (!pmb) {
        printf("%s() mk_alloc_repeater_block failed \n",__func__);
        return -1;
@@ -959,56 +1046,126 @@ int mk_handle_qu_pkt_repeater(MkRepeaterInfo *pmri, int rxsd, void *rxpkt, size_
    memcpy(pmb->peerdata,rxpkt,pktlen);
    pmb->peerdata_len = pktlen;
 
-   memcpy(pmb->ifrsds,pmri->ifRefs,sizeof(IfsInfo)*pmri->numifs);
+   // copy the reference to parent info
+   pmb->pmri = pmri;
+   pmb->ifrsds = pmri->ifRefs;
    pmb->numifs = pmri->numifs;
-   for (i = 0 ; (i < pmb->numifs) && (i < MAX_UNICAST_IFS) ; i++) {
-      rc = mk_setup_repater_socket(&pmb->ifrsds[i],NULL);
-      if ( rc < 0 ) {
-        printf("%s() i=%d mk_setup_repater_socket failed for interface=%s addr=%s \n",
-                __func__,i,pmb->ifrsds[i].ifname,inet_ntoa(pmb->ifrsds[i].ifaddr));
-        memset(&pmb->ifrsds[i],0,sizeof(IfsInfo));
-      }
+
+   memset(pmb->quKeyName,0,sizeof(pmb->quKeyName));
+   strncpy(pmb->quKeyName, (char *)pmb->peerdata + MDNS_FILTER_HDRSZ + KEY_START_POS, KEY_END_SZ);
+   pmb->quKeyNameLen = strlen(pmb->quKeyName);
+
+   pmb->key.kval = (void *)pmb->quKeyName;
+   pmb->key.klen = pmb->quKeyNameLen;
+
+   // remove old node if any as the tuple associated with old is invalid now
+   // NOTE: oldpmb block will be freed via registered destroy data function
+   mk_hash_remove(&pmri->quHash,(void *)&pmb->key);
+
+   // insert the new one
+   rc = mk_hash_insert(&pmri->quHash,(void *)pmb,(void *)&pmb->key);
+   if (rc < 0) {
+     printf("%s() hash insert failed \n",__func__);
+     mk_free_repeater_block(pmb);
+     return -1;
    }
 
-   //  For now spin a thread to handle this.
-   //  TODO: change from n:m threads to  scalable n:1 thread, so that all the
-   //  requets are handled in just one thread -- with suitable i/o wait of sds.
-
-   rc = pthread_create(&t, NULL, mk_mdns_unicast_pkt_repeater_thread, (void *)pmb);
+   rc = mk_mdns_unicast_pkt_repeater_snd(pmb);
    if ( rc != 0 ) {
-      printf("%s() pthread_create failed errno=%d %s \n",
-                  __func__,errno,strerror(errno));
+      printf("%s() mk_mdns_unicast_pkt_repeater_snd failed \n",__func__);
+      mk_hash_remove(&pmri->quHash,(void *)&pmb->key);
       return -1;
    }
 
    return rc;
 }
 
-void * mk_mdns_unicast_pkt_repeater_thread(void *targ)
+int mk_mdns_unicast_ifs_sock_select_process(MkRepeaterInfo * pmri, fd_set *prfds, int numfd)
 {
-  MkRepeaterBlock *pmb = (MkRepeaterBlock *)targ;
   int rc = 0;
-  struct sockaddr_in src_addr;
-  socklen_t addrlen = sizeof(src_addr);
-  #define RX_BUFF 2048
-  char recv_buff[RX_BUFF] = {0}; //more than enough for our response
-  #define MK_RESPONSE_WAIT_SEC 2
-  struct timeval tstart= {0,0};
-  struct timeval cur_t = {0,0};
-  long int elapsedms = 0;
-  long int timeoutms = MK_RESPONSE_WAIT_SEC * 1000;
-  ssize_t iret = 0;
-  int err = 0;
   int i = 0;
-  struct timeval tvsel = {0,0};
-  fd_set rfds;
+
+   if ((!pmri)||(!prfds)||(numfd <= 0)) {
+     return -1;
+   }
+
+   if ( (numfd == 1) && (FD_ISSET(pmri->ingress_sd , prfds)) ) {
+     // printf("%s(not ours) numfd is 1 and ingress_sd=%d is set \n",__func__,pmri->ingress_sd);
+     return -1;
+   }
+
+   for (i = 0; (i < pmri->numifs); i++) {
+	  // printf("%s() i=%d numfd=%d \n",__func__,i,numfd);
+	  IfsInfo *p = &pmri->ifRefs[i];
+	  if (p->sd  <= 0) {
+	     continue;
+	  }
+	  if (FD_ISSET(p->sd, prfds)) {
+                ssize_t iret = 0;
+                struct sockaddr_in src_addr;
+                socklen_t addrlen = sizeof(src_addr);
+                #define RX_BUFF 2048
+                char recv_buff[RX_BUFF] = {0}; //more than enough for our response
+		// memset(recv_buff, 0, RX_BUFF);
+		memset(&src_addr,0,sizeof(src_addr));
+		iret = (int)recvfrom(p->sd, recv_buff, RX_BUFF, 0,
+				   (struct sockaddr *)&src_addr, &addrlen);
+		// printf("%s() recvfrom iret=%d i=%d numfd=%d \n",__func__,iret,i,numfd);
+		if (iret < 0) {
+		    // May be continue with rest of the interface sockets.
+		    continue;
+		}
+
+		if (iret > 0) {
+
+		   MkRepeaterBlock *pmb = NULL;
+                   MultiByteKey k1;
+                   char KeyName[MAX_TXT_KEY_SZ+1] = {0};
+                   int KeyNameLen = 0;
+                   strncpy(KeyName, (char *)recv_buff + MDNS_FILTER_HDRSZ + KEY_START_POS, KEY_END_SZ);
+                   KeyNameLen = strlen(KeyName);
+                   k1.kval = (void *)KeyName;
+                   k1.klen = KeyNameLen;
+
+                   pmb = (MkRepeaterBlock *)mk_hash_find(&pmri->quHash, (void *)&k1);
+		   if (!pmb) {
+		       printf("%s() hash find failed Name=%s len=%d \n",__func__,KeyName,KeyNameLen);
+		       continue;
+		   }
+		   // printf("%s() hash find success... Name=%s len=%d \n",__func__,KeyName,KeyNameLen);
+
+		   //process the unciasted packet.
+		   //Now send the response packet back to the originating node rightaway.
+		   rc = sendto(pmb->ingress_sd, recv_buff, iret, 0, 
+				(struct sockaddr *)&pmb->sk_origin, sizeof(struct sockaddr_in));
+		   //TODO : decide if we need to create another source socket or use p->sd
+		   // We are now trying with the actual server software.
+
+		   printf("%s() sent back reply rc=%d \n",__func__,rc);
+
+                   // TODO decide about hash removal here
+                   // mk_hash_remove(&pmri->quHash,(void *)&pmb->key);
+		}
+	  }
+   } //end of for loop of if socks
+
+   // TODO-IMP if it is due for stale pmb entries from hash table
+   // and remove them.
+
+   return 0;
+}
+
+int mk_mdns_unicast_pkt_repeater_snd(MkRepeaterBlock *pmb)
+{
+  int rc = 0;
+  int i = 0;
+  int scount = 0;
 
    if (!pmb) {
-     return NULL;
+     return -1;
    }
-   pthread_detach(pthread_self());
 
-   //Step1: repeat -- multicast the received pkts -- from a dedicated src port
+   // Step1: repeat -- multicast the received pkts.
    for (i = 0; (i < pmb->numifs); i++) {
        IfsInfo *p = &pmb->ifrsds[i];
        if (p->sd  <= 0) {
@@ -1018,140 +1175,117 @@ void * mk_mdns_unicast_pkt_repeater_thread(void *targ)
        //TODO verify if this check is needed for mk_ packets.
 	if ((pmb->sk_origin.sin_addr.s_addr & p->ifmask.s_addr) ==
                                 (p->ifaddr.s_addr & p->ifmask.s_addr)) {
-		printf("%s() NOT repeating data to itself %s sockfd=%d \n",__func__,p->ifname,p->sd); 
+		// printf("%s() NOT repeating data to itself %s sockfd=%d \n",__func__,p->ifname,p->sd); 
 		continue;
         }
 	// repeat data
 	rc = send_packet(p->sd, pmb->peerdata, (size_t)pmb->peerdata_len);
 	if (rc < 0) {
-            // TODO mark the IfsInfo of this block with a flag.
 	    printf("%s() send_packet error %s: \n", __func__,strerror(errno));
             continue;
 	}
-   } // end of for loop of if socks
-  
-   //Step2 : timedwait i/o wait to get response from all interfaces 
-
-
-  tvsel.tv_sec = MK_RESPONSE_WAIT_SEC;
-  tvsel.tv_usec = 0;
-
-  rc = gettimeofday(&tstart, NULL);
-  if (rc < 0) {
-     printf("%s() gettimeofday error %s",__func__,strerror(errno));
-  }
-
-  do {
-       // Add the interface sockets to i/o select wait.
-       int maxsd = 0;
-       err = 0;
-       FD_ZERO(&rfds);
-       for (i = 0; (i < pmb->numifs); i++) {
-	  IfsInfo *p = &pmb->ifrsds[i];
-	  if (p->sd  <= 0) {
-	     continue;
-	  }
-
-	  FD_SET(p->sd, &rfds);
-
-	  if (p->sd > maxsd) {
-	    maxsd = p->sd;  //note down the max sd for use with select i/o later
-	  }
-       } //end of for loop of if socks
-
-       if (maxsd <= 0) {
-          err = 1;
-          break ;
-       }
-
-       // wait on select and process the response
-       tvsel.tv_sec = MK_RESPONSE_WAIT_SEC;
-       tvsel.tv_usec = 0;
-       rc = select(maxsd + 1, &rfds, NULL, NULL, &tvsel);
-       if (rc > 0) {
-	     for (i = 0; (i < pmb->numifs); i++) {
-		IfsInfo *p = &pmb->ifrsds[i];
-		if (p->sd  <= 0) {
-		   continue;
-		}
-		if (FD_ISSET(p->sd, &rfds)) {
-                     // do a recvfrom followed by send to origin using the origin socket.
-		      memset(recv_buff, 0, RX_BUFF);
-		      memset(&src_addr,0,sizeof(src_addr));
-		      iret = (int)recvfrom(p->sd, recv_buff, RX_BUFF, 0,
-					 (struct sockaddr *)&src_addr, &addrlen);
-		      if (iret < 0) {
-			  // May be continue with rest of the interface sockets.
-			  continue;
-		      }
-
-		      if (iret > 0) {
-			 //process the unciasted packet.
-			 //Now send the response packet back to the originating node rightaway.
-	                 rc = sendto(pmb->ingress_sd, recv_buff, iret, 0, 
-                                      (struct sockaddr *)&pmb->sk_origin, sizeof(struct sockaddr_in));
-                         //TODO : decide if we need to create another source socket or use p->sd
-                         // We are now trying with the actual server software.
-		      }
-		}
-	     } //end of for loop of if socks
-       } else if (rc == 0) {
-	 // rc == 0 select timeout occured
-	 printf("%s() select receive timeout:%d sec", __func__,MK_RESPONSE_WAIT_SEC);
-	 break;
-       } else {
-	 //(rc < 0) : select error
-	 err = 1;
-	 printf("%s() select() error %d %s",__func__,errno,strerror(errno) );
-	 break;
-       }
-
-        if (timeoutms > 0) {
-	  rc = gettimeofday(&cur_t, NULL);
-	  if (rc < 0) {
-             printf("%s() gettimeofday error %s",__func__,strerror(errno));
-	  }
-
-	  elapsedms = ((cur_t.tv_usec - tstart.tv_usec)/1000) +
-			  (cur_t.tv_sec - tstart.tv_sec)*1000 ;
+        if(rc > 0) {
+           scount++;
         }
+   } // end of for loop of fixed interface sockets.
+   
+   if ( scount == 0 ) {
+       // No send had happened.
+       return -1;
+   }
+  
+   // rc = gettimeofday(&pmb->tlast, NULL);
+   // if (rc < 0) {
+   //    printf("%s() gettimeofday error %s",__func__,strerror(errno));
+   // }
+  
+   // printf("%s() returning, sendcnt=%d , quKeyNameLen=%d quKeyName=%s\n",
+     //                 __func__,scount,pmb->quKeyNameLen,pmb->quKeyName);
 
-     } while((err == 0) && ((timeoutms > 0)&&(elapsedms >=0)&&(elapsedms < timeoutms)));
-
-   printf("%s() returning, err=%d timeoutms=%ld, elapsedms=%ld \n",
-  	    __func__,err,timeoutms,elapsedms);
-
-   mk_free_repeater_block(pmb);
-   return NULL;
+   return 0;
 }
 
-MkRepeaterInfo* mk_init_unicast_repeater(void)
+int mk_init_unicast_repeater(MkRepeaterInfo ** ppgmri, 
+                                      struct if_sock *ifs, int numifs, int rxsd)
 {
-   MkRepeaterInfo * pmri = malloc(sizeof(MkRepeaterInfo));
+   int rc=0;
+
+   if ((!ifs) || (numifs <= 0)) {
+      return -1;
+   }
+
+   MkRepeaterInfo * pmri = (MkRepeaterInfo *)malloc(sizeof(MkRepeaterInfo));
    if (!pmri) {
-      return NULL;
+      return -1;
    }
+
    memset(pmri,0,sizeof(MkRepeaterInfo));
-   if (pthread_mutex_init(&pmri->rmtx,NULL) != 0) {
-     free(pmri);
-     return NULL;
+
+   // TODO need to verify if data destroy free is ok
+   rc = mk_hash_init(&pmri->quHash, MK_HASH_COUNT, mk_gen_mbyte_khash,
+		multi_byte_compare, (hash_alloc_t)malloc, free, NULL, mk_free_repeater_block);
+   if (rc < 0) {
+      printf("%s() mk_hash_init failed for quHash: MK_HASH_COUNT=%d \n",
+               __func__,MK_HASH_COUNT);
+      free(pmri);
+      return -1;
    }
-   return pmri;
+        
+   pmri->ingress_sd = rxsd;
+
+   for (int i = 0; i < numifs && i < MAX_UNICAST_IFS; i++) {
+     // For now copy the list of interface details from ifs
+     // TODO get the list of all network interface details from system.
+     if (ifs[i].ifname) {
+	 strncpy(pmri->ifRefs[i].ifname, ifs[i].ifname,IFNAMSIZ);
+	 memcpy(&pmri->ifRefs[i].ifaddr, &ifs[i].addr, sizeof(struct in_addr));
+	 memcpy(&pmri->ifRefs[i].ifmask, &ifs[i].mask, sizeof(struct in_addr));
+	 pmri->numifs++;
+	 printf("%d) ifname[%s] addr[%s] mask[%s] \n",i,pmri->ifRefs[i].ifname,
+		inet_ntoa(pmri->ifRefs[i].ifaddr),
+		inet_ntoa(pmri->ifRefs[i].ifmask));
+	 rc = mk_setup_repater_socket(&pmri->ifRefs[i],NULL);
+	 if ( rc < 0 ) {
+	   printf("%s() i=%d mk_setup_repater_socket failed for interface=%s addr=%s \n",
+		   __func__,i,pmri->ifRefs[i].ifname,inet_ntoa(pmri->ifRefs[i].ifaddr));
+	   pmri->ifRefs[i].sd = -1;
+	 }
+     }
+   }
+
+   if (ppgmri) {
+     *ppgmri = pmri;
+   }
+
+   return 0;
 }
 
 int mk_destroy_unicast_repeater(MkRepeaterInfo *pmri)
 {
+   int i=0;
    if (!pmri) {
       return -1;
    }
-   pthread_mutex_destroy(&pmri->rmtx);
-   // memset(pmri,0,sizeof(MkRepeaterInfo));
+
+   mk_hash_deinit(&pmri->quHash);
+
+   // close interface sockets
+   for (i = 0; (i < pmri->numifs) && (i < MAX_UNICAST_IFS); i++) {
+      if (pmri->ifRefs[i].sd > 0) {
+        printf("%s() i=%d closing if sock=%d for interface=%s addr=%s \n",
+                __func__,i,pmri->ifRefs[i].sd,pmri->ifRefs[i].ifname,inet_ntoa(pmri->ifRefs[i].ifaddr));
+          close(pmri->ifRefs[i].sd);
+          pmri->ifRefs[i].sd = -1;
+      }
+   }
+   
    free(pmri);
    g_pmri = NULL;
+
    return 0;
 }
 
-MkRepeaterBlock * mk_alloc_repeater_block(MkRepeaterInfo *pmri, struct sockaddr_in *src_addr)
+MkRepeaterBlock * mk_alloc_repeater_block(MkRepeaterInfo *pmri)
 {
   MkRepeaterBlock *pmb = NULL;
   if ( !pmri ) {
@@ -1160,44 +1294,41 @@ MkRepeaterBlock * mk_alloc_repeater_block(MkRepeaterInfo *pmri, struct sockaddr_
 
   if (pmri->rpt_cnt < MAX_UNICAST_REPEATERS) {
      // TODO avoid malloc and get it from preallocated slots.
-     pmb = malloc(sizeof(MkRepeaterBlock));
+     pmb = (MkRepeaterBlock *)malloc(sizeof(MkRepeaterBlock));
   }
 
   //pmb will be NULL if mallco failed or (rpt_cnt >= MAX_UNICAST_REPEATERS)
   if (!pmb) {
     //unlikley but check
+     printf("%s() failed rpt_cnt=%d MAX_UNICAST_REPEATERS=%d \n",
+                         __func__,pmri->rpt_cnt,MAX_UNICAST_REPEATERS);
      return NULL;
   }
 
-  pthread_mutex_lock(&pmri->rmtx);
     pmri->rpt_cnt++;
-  pthread_mutex_unlock(&pmri->rmtx);
 
   pmri->t_in++;
   return pmb;
 }
 
-int mk_free_repeater_block(MkRepeaterBlock * pmb)
+void mk_free_repeater_block(void * vpmb)
 {
-  int i=0;
+  MkRepeaterBlock *pmb = (MkRepeaterBlock *)vpmb;
+  MkRepeaterInfo *pmri = NULL;
+
   if (!pmb) {
-    return -1;
-  }
-  for (i = 0; (i < pmb->numifs) && (i < MAX_UNICAST_IFS); i++) {
-      if (pmb->ifrsds[i].sd > 0) {
-         close(pmb->ifrsds[i].sd);
-      }
-  }
-  memset(pmb,0,sizeof(MkRepeaterBlock));
-
-  if (g_pmri) {
-    pthread_mutex_lock(&g_pmri->rmtx);
-      g_pmri->rpt_cnt--;
-    pthread_mutex_unlock(&g_pmri->rmtx);
+    return;
   }
 
+  pmri = (MkRepeaterInfo *)pmb->pmri;
+  if (pmri) {
+      pmri->rpt_cnt--;
+  }
+
+  // memset(pmb,0,sizeof(MkRepeaterBlock));
   free(pmb);
-  return 0;
+
+  return;
 }
 
 int mk_setup_repater_socket(IfsInfo *pifs, char *updateifname)
@@ -1304,6 +1435,305 @@ int mk_setup_repater_socket(IfsInfo *pifs, char *updateifname)
 	}
 
 	return 0;
+}
+
+// simple hash functionality as glibc does not a flexible one.
+// glibc hcreate and hsearch does not even have a node delete and iterator functionality 
+int mk_hash_init(mkHashInfo     *ctx,
+              unsigned int            numSlots,
+              function_gen_hash    gen_key_hash,
+              hash_comp_t    comp,
+              hash_alloc_t   alloc,
+              hash_free_t    dealloc,
+              hash_destroy_t destroy_key,
+              hash_destroy_t destroy_data
+)
+{
+   unsigned int i = 0 ;
+
+   if ((ctx == NULL) ||
+       (alloc == NULL) || (gen_key_hash == NULL) ||
+       (comp == NULL) || (dealloc == NULL)) {
+      return -1;
+   }
+
+   if((numSlots == 0) || (numSlots > HASH_MAX_NODES)) {
+      numSlots = HASH_MAX_NODES ;
+   }
+
+   ctx->used = 0;
+   ctx->gen_key_hash = gen_key_hash;
+   ctx->comp = comp;
+   ctx->alloc = alloc;
+   ctx->dealloc = dealloc;
+   ctx->numSlots = numSlots;
+   ctx->destroy_key = destroy_key;
+   ctx->destroy_data = destroy_data;
+
+   ctx->ppSlots = (HashNode **) ctx->alloc(sizeof(HashNode *) * ctx->numSlots);
+   if(ctx->ppSlots == NULL) {
+      return -1;
+   }
+   for (i = 0; i < ctx->numSlots; ++i) {
+      ctx->ppSlots[i] = NULL;
+   }
+   return 0;
+}
+
+void mk_hash_deinit(mkHashInfo *ctx)
+{
+    if (!ctx) { 
+       return ; 
+    }
+
+    // Remove all the hash node contents.
+    mk_hash_destroy_all(ctx);
+
+    // Now remove the hash ppSlots.
+    if (ctx->ppSlots) {
+        ctx->dealloc(ctx->ppSlots);
+        ctx->ppSlots = NULL;
+    }
+}
+
+void *mk_hash_find(mkHashInfo *ctx, void *key)
+{
+    unsigned int bidx;
+    unsigned int hskey = 0 ;
+    HashNode *node;
+
+   if ((!ctx) || (!key)) { 
+     return NULL ;
+   }
+
+   if ((!ctx->numSlots) || (!ctx->gen_key_hash)) { 
+      return NULL ;
+   }
+
+    hskey = ctx->gen_key_hash(key);
+    bidx = hskey % ctx->numSlots;
+
+    node = ctx->ppSlots[bidx];
+
+    // printf("%s(%p) hskey=%u key=%p bidx=%u node=>>%p used=%d\n",
+    //           __func__,ctx,hskey,key,bidx,node,ctx->used);
+
+    // traverse all chained entries in a slot.
+    while (node != NULL) {
+            if(ctx->comp(node->key, key) == 0)
+            return node->data;
+
+        node = node->next;
+    }
+    return NULL;
+}
+
+int mk_hash_insert(mkHashInfo *ctx, void *data, void *key)
+{
+    unsigned int bidx = 0 ;
+    unsigned int hskey = 0 ;
+    HashNode *node = NULL ;
+
+   if ((!ctx) || (!key)) { 
+     return -1 ;
+   }
+
+    hskey = ctx->gen_key_hash(key) ;
+    bidx = hskey % ctx->numSlots;
+    node = ctx->ppSlots[bidx];
+
+    while (node != NULL) {
+        // checking to see if there is no duplicate key: Duplicate insertion
+        if(ctx->comp(node->key, key) == 0)
+            return -1;
+
+        node = node->next;
+    }
+
+    node = (HashNode*) ctx->alloc(sizeof(HashNode));
+    if(node == NULL) {
+        return -2;
+    }
+
+    node->key = key;
+    node->data = data;
+    node->next = ctx->ppSlots[bidx];
+    ctx->ppSlots[bidx] = node;
+    ctx->used++;
+    // printf("%s(%p) key=%p bidx=%u node=>>%p used=%d\n",
+    //          __func__,ctx,key,bidx,node,ctx->used);
+
+    return 0;
+}
+
+void mk_hash_remove(mkHashInfo *ctx, void *key)
+{
+    unsigned int bidx;
+    unsigned int hskey = 0 ;
+    HashNode *node, *prev;
+
+    if ((!ctx) || (!key)) {
+        return ;
+    }
+
+    hskey = ctx->gen_key_hash(key);
+    bidx = hskey % ctx->numSlots;
+    node = ctx->ppSlots[bidx];
+    prev = NULL;
+
+    while (node != NULL) {
+        if (ctx->comp(node->key, key) == 0) {
+	    if (prev != NULL) {
+	        prev->next = node->next;
+	    }
+	    else {
+	        ctx->ppSlots[bidx] = node->next;
+	    }
+
+            if(ctx->destroy_key != NULL)
+                ctx->destroy_key(node->key);
+            if(ctx->destroy_data != NULL)
+                ctx->destroy_data(node->data);
+
+            ctx->dealloc(node);
+            ctx->used--;
+            // printf("%s() , ctx=%p used=%d \n",__func__,ctx,ctx->used);
+
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+}
+
+void mk_hash_destroy_all(mkHashInfo *ctx)
+{
+    if (!ctx) { return; }
+
+    if (ctx->used > 0) {
+        unsigned int i;
+        HashNode *node, *next;
+
+        // Loop through every hash node
+        for (i = 0; i < ctx->numSlots; ++i) {
+            node = ctx->ppSlots[i];
+            if (node != NULL) {
+                while (node != NULL) {
+                    next = node->next;
+
+                    if(ctx->destroy_key != NULL)
+                        ctx->destroy_key(node->key);
+                    if(ctx->destroy_data != NULL)
+                        ctx->destroy_data(node->data);
+
+                    ctx->dealloc(node);
+                    ctx->used--;
+                    node = next;
+                }
+                ctx->ppSlots[i] = NULL;
+            }
+        }
+    }
+}
+
+int mk_hash_get_used(mkHashInfo *ctx)
+{
+    if (!ctx) { return -1; }
+    return ctx->used ;
+}
+
+HashNode *mk_hash_iter_begin(HashIter *iter, mkHashInfo *hash)
+{
+    unsigned int i;
+
+    if ((iter == NULL) || (hash == NULL)) {
+        return NULL;
+    }
+
+    // reset iterator
+    memset(iter, 0 , sizeof(HashIter));
+
+    if (hash->used == 0) {
+        return NULL;
+    }
+
+    // return the first non empty node.
+    for (i=0; i<hash->numSlots; ++i) {
+        if (hash->ppSlots[i] != NULL) {
+	    iter->node = hash->ppSlots[i];
+	    iter->bidx = i;
+	    iter->hash = hash;
+	    return iter->node;
+        }
+    }
+
+    hash->used = 0;
+    iter->node = NULL;
+    return NULL;
+}
+
+HashNode *mk_hash_iter_next(HashIter *iter)
+{
+    unsigned int i = 0;
+
+    if ((iter == NULL)||(iter->node == NULL)) {
+        return NULL;
+    }
+
+    // First go over current chained list if any
+    if (iter->node->next != NULL) {
+        //printf("iter->node=%p and iter-node->next=%p\n",
+        //          iter->node,iter->node->next);
+
+        iter->node = iter->node->next;
+        return iter->node;
+    }
+
+    // find and return next non-empty slot
+    for (i=iter->bidx+1; i<iter->hash->numSlots; ++i) {
+        if (iter->hash->ppSlots[i] != NULL) {
+	   iter->node = iter->hash->ppSlots[i];
+	   iter->bidx = i;
+	   return iter->node;
+        }
+    }
+
+    // No more nodes were found in the ppSlots. Mark iterator has finished.
+    iter->node = NULL;
+    return NULL;
+}
+
+unsigned int mk_gen_mbyte_khash(void *key)
+{
+  int i = 0;
+  MultiByteKey *mk = (MultiByteKey *)key;
+  unsigned val = 0;
+  if ((!mk)||(!mk->klen)||(!mk->kval)) {
+    return 0;
+  }
+
+  for (i = 0; i < mk->klen; i++) {
+     val = val + mk->kval[i];
+  }
+
+  return val;
+}
+
+unsigned int multi_byte_compare(const void *key1, const void *key2)
+{
+    MultiByteKey *k1 = (MultiByteKey *)key1 ;
+    MultiByteKey *k2 = (MultiByteKey *)key2 ;
+#if 0
+    printf("%s() k1=%p , k2=%p , k1->kval=%p , k2->kval=%p"
+           "k1->klen=%d k2->klen=%d k1->kval=%s k2->kval=%s \n",
+           __func__,k1,k2,k1->kval,k2->kval,k1->klen,k2->klen,
+           (char *)k1->kval,(char *)k2->kval);
+#endif
+    if(k1 && k2 && k1->kval && k2->kval &&
+       (k1->klen == k2->klen) && (!memcmp(k1->kval,k2->kval,k1->klen))) {
+       return 0 ;
+    }
+    return 1;
 }
 
 //------------------ End   mk_unicast_repeater ---------------------------------
